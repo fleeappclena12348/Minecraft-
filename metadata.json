@@ -1,0 +1,5 @@
+{
+  "name": "Minecraftコマンドメーカー",
+  "description": "Gemini 3 Proを活用して、Java版およびBedrock版の複雑なMinecraftコマンドを生成するAIツール。",
+  "requestFramePermissions": []
+}

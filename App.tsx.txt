@@ -1,0 +1,387 @@
+
+import React, { useState, useEffect, useMemo, useRef } from 'react';
+import { GoogleGenAI, Type } from "@google/genai";
+import { GameEdition, ExecutionTarget, CommandResponse, HistoryItem, AdvancedOptions } from './types';
+import CommandOutput from './components/CommandOutput';
+import HistorySidebar from './components/HistorySidebar';
+import ErrorModal from './components/ErrorModal';
+import Notification from './components/Notification';
+
+const COMMAND_TEMPLATES = [
+  { id: 'tp', label: 'テレポート', icon: 'fa-location-arrow', category: 'Common', text: '特定の座標(0 64 0)にテレポートさせる', hint: 'Java/Bedrock共通の基本構文です' },
+  { id: 'give', label: 'アイテム付与', icon: 'fa-cube', category: 'Items', text: '最強のエンチャントが付いたダイヤモンドの剣を出す', hint: '1.20.5以降のJava版は[components]を使用します' },
+  { id: 'summon', label: 'モブ召喚', icon: 'fa-ghost', category: 'Items', text: '名前が「守護神」で体力が100あるゾンビを召喚する', hint: 'BedrockではNBTによる属性付与が制限されます' },
+  { id: 'clear', label: 'インベントリ清去', icon: 'fa-eraser', category: 'Utility', text: '特定のプレイヤーの持ち物を全て消去する', hint: 'アイテムIDを指定して部分的な削除も可能です' },
+  { id: 'gamerule_keep', label: 'アイテム保持', icon: 'fa-shield-heart', category: 'World', text: '死亡時にアイテムを落とさない設定(keepInventory)を有効にする', hint: 'Java: keepInventory / Bedrock: keepinventory' },
+  { id: 'difficulty', label: '難易度変更', icon: 'fa-skull', category: 'World', text: '世界の難易度をハードに変更する', hint: 'Bedrockでは0〜3の数値指定も可能です' },
+  { id: 'weather', label: '天候操作', icon: 'fa-cloud-showers-heavy', category: 'World', text: '天気を雷雨に変更し、持続時間を設定する', hint: '演出効果(パーティクル)と組み合わせると効果的です' },
+  { id: 'effect', label: 'ステータス付与', icon: 'fa-flask', category: 'Utility', text: '透明化と移動速度上昇を10分間付与する', hint: 'パーティクルを非表示にする引数も生成可能です' },
+  { id: 'fill', label: '範囲設置', icon: 'fa-border-all', category: 'Items', text: '自分の周囲をガラスの壁で囲む', hint: 'replace/keep引数で既存のブロックを保護できます' },
+  { id: 'particle', label: 'パーティクル', icon: 'fa-sparkles', category: 'Utility', text: '足元にエンドロッドのパーティクルを円状に出し続ける', hint: 'JavaとBedrockでパーティクル名の定義が大きく異なります' },
+];
+
+const STORAGE_KEY = 'mc_command_gen_history';
+
+const App: React.FC = () => {
+  const [prompt, setPrompt] = useState('');
+  const [edition, setEdition] = useState<GameEdition>(GameEdition.JAVA);
+  const [isLoading, setIsLoading] = useState(false);
+  const [progress, setProgress] = useState(0);
+  const [currentStage, setCurrentStage] = useState('Initializing...');
+  const [result, setResult] = useState<CommandResponse | null>(null);
+  const [history, setHistory] = useState<HistoryItem[]>([]);
+  const [showHistory, setShowHistory] = useState(false);
+  const [showAdvanced, setShowAdvanced] = useState(false);
+  const [selectedCategory, setSelectedCategory] = useState<string>('All');
+  const [generationMode, setGenerationMode] = useState<'precision' | 'speed'>('precision');
+  const [errorDetail, setErrorDetail] = useState<{message: string, stack?: string} | null>(null);
+  const [showNotification, setShowNotification] = useState(false);
+  const [notifMessage, setNotifMessage] = useState('生成完了！');
+  const fileInputRef = useRef<HTMLInputElement>(null);
+  
+  const [advanced, setAdvanced] = useState<AdvancedOptions>({
+    complexity: 'advanced',
+    targetSelector: '@p',
+    includeNBT: true,
+    executionTarget: ExecutionTarget.CHAT
+  });
+
+  const categories = useMemo(() => ['All', ...new Set(COMMAND_TEMPLATES.map(t => t.category))], []);
+
+  const filteredTemplates = useMemo(() => {
+    if (selectedCategory === 'All') return COMMAND_TEMPLATES;
+    return COMMAND_TEMPLATES.filter(t => t.category === selectedCategory);
+  }, [selectedCategory]);
+
+  useEffect(() => {
+    const savedHistory = localStorage.getItem(STORAGE_KEY);
+    if (savedHistory) {
+      try {
+        setHistory(JSON.parse(savedHistory));
+      } catch (e) {
+        console.error("Failed to load history from localStorage", e);
+      }
+    }
+  }, []);
+
+  useEffect(() => {
+    localStorage.setItem(STORAGE_KEY, JSON.stringify(history));
+  }, [history]);
+
+  const validation = useMemo(() => {
+    if (!prompt.trim()) return null;
+    const hints = [];
+    const p = prompt.toLowerCase();
+
+    if (edition === GameEdition.BEDROCK && (p.includes('nbt') || p.includes('custom_data'))) {
+      hints.push({ type: 'error', text: '統合版(Bedrock)ではNBTタグは直接使用できません。' });
+    }
+    if (edition === GameEdition.JAVA && (p.includes('components') || p.includes('minecraft:item'))) {
+      hints.push({ type: 'info', text: 'Java 1.20.5以降のデータコンポーネント構文を使用します。' });
+    }
+    
+    const isLikelyLong = p.includes('大量') || p.includes('最強') || p.includes('複雑') || p.length > 40 || advanced.complexity === 'ultra';
+    if (isLikelyLong) {
+      hints.push({ type: 'warn', text: '入力内容から長文化が予想されます。自動的に実行環境を判断します。' });
+    }
+    
+    return hints;
+  }, [prompt, edition, advanced.complexity]);
+
+  useEffect(() => {
+    let interval: number;
+    const stages = [
+      '構文エンジンの初期化中...',
+      'エディション固有のルールを適用中...',
+      'NBT/コンポーネント構造の計算中...',
+      'Gemini AIによるコマンド最適化中...',
+      '実行環境の検証中...',
+      '最終出力をパース中...'
+    ];
+
+    if (isLoading) {
+      setProgress(0);
+      setCurrentStage(stages[0]);
+      const stepBase = generationMode === 'precision' ? 0.3 : 1.5;
+      const step = advanced.complexity === 'ultra' ? stepBase * 0.4 : stepBase;
+      
+      interval = window.setInterval(() => {
+        setProgress(prev => {
+          const next = prev + Math.random() * step;
+          const stageIndex = Math.min(Math.floor((next / 100) * stages.length), stages.length - 1);
+          setCurrentStage(stages[stageIndex]);
+          
+          if (next < 98) return next;
+          return prev;
+        });
+      }, 100);
+    } else {
+      setProgress(100);
+    }
+    return () => clearInterval(interval);
+  }, [isLoading, generationMode, advanced.complexity]);
+
+  const generateCommand = async () => {
+    if (!prompt.trim()) return;
+    setIsLoading(true);
+    setResult(null);
+    setErrorDetail(null);
+
+    try {
+      const ai = new GoogleGenAI({ apiKey: process.env.API_KEY || '' });
+      const model = generationMode === 'precision' ? 'gemini-3-pro-preview' : 'gemini-3-flash-preview';
+      
+      let thinkingBudget = 0;
+      if (generationMode === 'precision') {
+        thinkingBudget = advanced.complexity === 'ultra' ? 32768 : 16000;
+      }
+
+      const systemInstruction = `あなたはMinecraftコマンドの技術専門家です。
+1. ${edition} の最新仕様を適用。
+2. 実行環境を自動判断。
+3. Java版 1.20.5以降の[item_components]と、それ以前の{NBT}を正確に使い分ける。
+4. 複雑なリクエスト(complexity: ultra)の場合、可能な限り詳細なパラメータを設定。
+5. 解説は日本語。
+6. 必ずJSON形式で返答してください。JSON以外のテキストは含めないでください。`;
+
+      const contextPrompt = `
+      リクエスト内容: ${prompt}
+      エディション: ${edition}
+      複雑度: ${advanced.complexity}
+      ターゲット: ${advanced.targetSelector}
+      NBT/コンポーネントを含める: ${advanced.includeNBT}`;
+
+      const response = await ai.models.generateContent({
+        model: model,
+        contents: contextPrompt,
+        config: {
+          systemInstruction,
+          responseMimeType: "application/json",
+          thinkingConfig: thinkingBudget > 0 ? { thinkingBudget } : undefined,
+          responseSchema: {
+            type: Type.OBJECT,
+            properties: {
+              command: { type: Type.STRING, description: "生成されたMinecraftコマンド" },
+              explanation: { type: Type.STRING, description: "コマンドの動作解説" },
+              versionCompatible: { type: Type.STRING, description: "対応バージョン(例: 1.21.x)" },
+              warnings: { type: Type.ARRAY, items: { type: Type.STRING }, description: "使用上の注意や制限事項" },
+            },
+            required: ["command", "explanation", "versionCompatible"],
+          }
+        }
+      });
+
+      if (!response.text) {
+        throw new Error("AIからの応答が解析できませんでした。");
+      }
+
+      const parsed: CommandResponse = JSON.parse(response.text.trim());
+      
+      // Auto-detect execution target based on length
+      const detectedTarget = parsed.command.length > 256 ? ExecutionTarget.BLOCK : ExecutionTarget.CHAT;
+      setAdvanced(prev => ({ ...prev, executionTarget: detectedTarget }));
+
+      setResult(parsed);
+      setNotifMessage(detectedTarget === ExecutionTarget.BLOCK ? '長文コマンドのためコマンドブロック用として生成しました' : '生成完了！');
+      setShowNotification(true);
+      setHistory(prev => [{ id: Date.now().toString(), prompt, response: parsed, edition, timestamp: Date.now() }, ...prev]);
+    } catch (error: any) {
+      console.error("Command Generation Failed:", error);
+      setErrorDetail({ 
+        message: error.message || "コマンドの生成中にエラーが発生しました。", 
+        stack: error.stack 
+      });
+    } finally {
+      setIsLoading(false);
+    }
+  };
+
+  const exportData = () => {
+    const data = { version: "2.6", exportDate: new Date().toISOString(), history: history };
+    const blob = new Blob([JSON.stringify(data, null, 2)], { type: 'application/json' });
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement('a');
+    link.href = url;
+    link.download = `mc-commands-backup-${new Date().toISOString().split('T')[0]}.json`;
+    link.click();
+    URL.revokeObjectURL(url);
+    setNotifMessage('データをエクスポートしました');
+    setShowNotification(true);
+  };
+
+  const handleImport = (event: React.ChangeEvent<HTMLInputElement>) => {
+    const file = event.target.files?.[0];
+    if (!file) return;
+    const reader = new FileReader();
+    reader.onload = (e) => {
+      try {
+        const imported = JSON.parse(e.target?.result as string);
+        if (!imported.history) throw new Error("無効な形式です。");
+        setHistory(prev => {
+          const combined = [...imported.history, ...prev];
+          return Array.from(new Map(combined.map(item => [item.id, item])).values()).sort((a, b) => b.timestamp - a.timestamp);
+        });
+        setNotifMessage('データをインポートしました');
+        setShowNotification(true);
+      } catch (err: any) {
+        setErrorDetail({ message: "インポートエラー", stack: err.message });
+      }
+    };
+    reader.readAsText(file);
+  };
+
+  const clearHistory = () => { if (window.confirm('すべての履歴を削除しますか？')) setHistory([]); };
+  const deleteHistoryItem = (id: string) => { setHistory(prev => prev.filter(item => item.id !== id)); };
+
+  return (
+    <div className="min-h-screen flex flex-col bg-[#121212]">
+      <Notification show={showNotification} onClose={() => setShowNotification(false)} message={notifMessage} />
+      <input type="file" ref={fileInputRef} onChange={handleImport} accept=".json" className="hidden" />
+      
+      <header className="gradient-bg p-6 shadow-2xl flex justify-between items-center border-b-4 border-[#2d5a1d]">
+        <div className="flex items-center space-x-4">
+          <i className="fa-solid fa-microchip text-3xl text-white bg-white/10 p-2 rounded-lg"></i>
+          <h1 className="text-4xl mc-font tracking-wider text-white drop-shadow-md">COMMAND GEN</h1>
+        </div>
+        <div className="flex items-center gap-4">
+          <div className="hidden md:flex bg-black/20 p-1 rounded-lg border border-white/10 mr-2">
+            <button onClick={exportData} className="p-2 text-gray-400 hover:text-white transition-colors"><i className="fa-solid fa-file-export"></i></button>
+            <button onClick={() => fileInputRef.current?.click()} className="p-2 text-gray-400 hover:text-white transition-colors"><i className="fa-solid fa-file-import"></i></button>
+          </div>
+          <div className="bg-black/20 p-1 rounded-lg flex items-center border border-white/10">
+            <button onClick={() => setGenerationMode('precision')} className={`px-3 py-1 rounded text-xs font-bold transition-all flex items-center gap-2 ${generationMode === 'precision' ? 'bg-blue-600 text-white shadow-lg' : 'text-gray-500 hover:text-gray-300'}`}><i className="fa-solid fa-brain"></i>精度重視</button>
+            <button onClick={() => setGenerationMode('speed')} className={`px-3 py-1 rounded text-xs font-bold transition-all flex items-center gap-2 ${generationMode === 'speed' ? 'bg-[#7fb332] text-white shadow-lg' : 'text-gray-500 hover:text-gray-300'}`}><i className="fa-solid fa-bolt"></i>速度重視</button>
+          </div>
+          <button onClick={() => setShowHistory(!showHistory)} className="bg-black/30 hover:bg-black/50 text-white px-4 py-2 rounded-md transition-colors flex items-center gap-2 relative">
+            <i className="fa-solid fa-book-bookmark"></i>履歴
+            {history.length > 0 && <span className="absolute -top-1 -right-1 bg-red-500 text-white text-[10px] w-4 h-4 rounded-full flex items-center justify-center font-bold border border-white/20">{history.length}</span>}
+          </button>
+        </div>
+      </header>
+
+      <main className="flex-1 container mx-auto p-4 md:p-8 flex gap-6 relative">
+        <div className="flex-1 max-w-4xl mx-auto w-full space-y-6">
+          <section className="glass-panel p-6 rounded-xl shadow-inner space-y-4 border border-white/5">
+            <div className="flex flex-wrap items-center justify-between gap-4">
+              <div className="flex items-center gap-4 flex-wrap">
+                <div className="flex items-center gap-2 bg-black/20 p-1 rounded-lg">
+                  <button onClick={() => setEdition(GameEdition.JAVA)} className={`px-4 py-1.5 rounded-md transition-all mc-font text-lg ${edition === GameEdition.JAVA ? 'bg-[#3c8527] text-white' : 'text-gray-400'}`}>Java</button>
+                  <button onClick={() => setEdition(GameEdition.BEDROCK)} className={`px-4 py-1.5 rounded-md transition-all mc-font text-lg ${edition === GameEdition.BEDROCK ? 'bg-[#3c8527] text-white' : 'text-gray-400'}`}>Bedrock</button>
+                </div>
+                <div className="flex items-center gap-2 bg-black/20 p-1 rounded-lg">
+                  <div className={`flex items-center gap-2 px-3 py-1.5 rounded-md text-xs font-bold ${advanced.executionTarget === ExecutionTarget.CHAT ? 'bg-blue-600 text-white' : 'bg-orange-600 text-white shadow-lg shadow-orange-900/40'}`}>
+                    <i className={`fa-solid ${advanced.executionTarget === ExecutionTarget.CHAT ? 'fa-comment' : 'fa-square'}`}></i>
+                    {advanced.executionTarget === ExecutionTarget.CHAT ? 'チャット推奨' : 'コマンドブロック必須'}
+                  </div>
+                </div>
+              </div>
+              <button onClick={() => setShowAdvanced(!showAdvanced)} className="text-sm text-gray-400 hover:text-white flex items-center gap-2 transition-colors">
+                <i className={`fa-solid fa-gears ${showAdvanced ? 'rotate-90 text-blue-400' : ''}`}></i>詳細設定
+              </button>
+            </div>
+
+            {showAdvanced && (
+              <div className="grid grid-cols-1 md:grid-cols-2 gap-4 p-4 bg-black/30 rounded-lg border border-white/5 animate-in slide-in-from-top-2">
+                <div className="space-y-1">
+                  <label className="text-xs font-bold text-gray-500 uppercase tracking-tighter">複雑度レベル</label>
+                  <select value={advanced.complexity} onChange={(e) => setAdvanced({...advanced, complexity: e.target.value as any})} className="w-full bg-[#2a2a2a] border border-white/10 rounded px-2 py-1 text-sm text-white focus:outline-none focus:ring-1 focus:ring-[#3c8527]">
+                    <option value="simple">シンプル (基本構文のみ)</option>
+                    <option value="advanced">標準 (NBT/コンポーネント)</option>
+                    <option value="ultra">ウルトラ (高度な属性・属性値)</option>
+                  </select>
+                </div>
+                <div className="space-y-1">
+                  <label className="text-xs font-bold text-gray-500 uppercase tracking-tighter">ターゲットセレクター</label>
+                  <select value={advanced.targetSelector} onChange={(e) => setAdvanced({...advanced, targetSelector: e.target.value})} className="w-full bg-[#2a2a2a] border border-white/10 rounded px-2 py-1 text-sm text-white focus:outline-none focus:ring-1 focus:ring-[#3c8527]">
+                    <option value="@p">@p (最寄りのプレイヤー)</option>
+                    <option value="@a">@a (全プレイヤー)</option>
+                    <option value="@e">@e (全エンティティ)</option>
+                    <option value="@s">@s (実行者自身)</option>
+                    <option value="@r">@r (ランダム)</option>
+                  </select>
+                </div>
+              </div>
+            )}
+
+            <div className="space-y-2">
+              <div className="flex items-center gap-2 overflow-x-auto no-scrollbar py-1">
+                {categories.map(cat => (
+                  <button key={cat} onClick={() => setSelectedCategory(cat)} className={`text-[10px] font-bold uppercase px-2 py-0.5 rounded-full border transition-all ${selectedCategory === cat ? 'bg-white text-black border-white' : 'text-gray-500 border-white/10 hover:border-white/30'}`}>{cat}</button>
+                ))}
+              </div>
+              <div className="flex flex-wrap gap-2 py-2 overflow-x-auto no-scrollbar">
+                {filteredTemplates.map((tmpl) => (
+                  <button key={tmpl.id} onClick={() => setPrompt(tmpl.text)} className="group relative flex items-center gap-2 bg-[#2d2d2d] hover:bg-[#3c8527] border border-white/10 rounded-full px-4 py-1.5 transition-all text-sm whitespace-nowrap text-gray-300 hover:text-white shadow-sm">
+                    <i className={`fa-solid ${tmpl.icon} text-xs`}></i>
+                    <span>{tmpl.label}</span>
+                    <div className="absolute bottom-full mb-2 left-1/2 -translate-x-1/2 w-48 p-2 bg-black/90 border border-white/10 rounded text-[10px] text-gray-400 opacity-0 group-hover:opacity-100 transition-opacity pointer-events-none z-50 shadow-xl whitespace-normal leading-normal">
+                      <span className="text-white font-bold block mb-1">{tmpl.label}のヒント:</span>{tmpl.hint}
+                    </div>
+                  </button>
+                ))}
+              </div>
+            </div>
+
+            <div className="relative">
+              <textarea value={prompt} onChange={(e) => setPrompt(e.target.value)} placeholder="生成したいコマンドの内容を入力してください（例：名前が赤色で攻撃力が+999のネザライトの剣を自分に与える）" className="w-full h-44 bg-black/40 border border-white/10 rounded-lg p-4 text-lg focus:outline-none focus:ring-2 focus:ring-[#3c8527] resize-none text-white transition-all shadow-inner placeholder:text-gray-600" />
+              {validation && validation.length > 0 && (
+                <div className="mt-2 space-y-1">
+                  {validation.map((hint, idx) => (
+                    <div key={idx} className={`flex items-center gap-2 text-[11px] px-3 py-1.5 rounded border animate-in slide-in-from-left-2 ${hint.type === 'error' ? 'bg-red-500/10 border-red-500/30 text-red-400' : hint.type === 'warn' ? 'bg-amber-500/10 border-amber-500/30 text-amber-300' : 'bg-blue-500/10 border-blue-500/30 text-blue-300'}`}>
+                      <i className={`fa-solid ${hint.type === 'error' ? 'fa-circle-exclamation' : hint.type === 'warn' ? 'fa-triangle-exclamation' : 'fa-circle-info'}`}></i>
+                      <span className="font-medium">{hint.text}</span>
+                    </div>
+                  ))}
+                </div>
+              )}
+              <button onClick={generateCommand} disabled={isLoading || !prompt.trim()} className={`absolute bottom-4 right-4 mc-button px-8 py-2 text-white mc-font text-2xl shadow-xl transition-all ${isLoading ? 'opacity-50 grayscale cursor-not-allowed' : 'hover:scale-105 active:translate-y-1 active:shadow-inner'}`}>{isLoading ? '生成中...' : '生成開始'}</button>
+            </div>
+          </section>
+
+          {isLoading && (
+            <div className="w-full glass-panel p-6 rounded-xl border border-white/5 animate-in zoom-in-95 duration-300 space-y-4">
+              <div className="flex justify-between items-end">
+                <div className="space-y-1">
+                  <div className="flex items-center gap-2">
+                    <div className="w-2 h-2 bg-green-500 rounded-full animate-ping"></div>
+                    <span className="mc-font text-[#c6c6c6] text-xl uppercase tracking-widest">Processing System Turn</span>
+                  </div>
+                  <p className="text-gray-400 text-xs font-mono">{currentStage}</p>
+                </div>
+                <div className="text-right"><span className={`mc-font text-3xl font-bold ${generationMode === 'precision' ? 'text-blue-400' : 'text-[#7fb332]'}`}>{Math.round(progress)}%</span></div>
+              </div>
+              <div className="relative">
+                <div className="h-6 w-full bg-[#1a1a1a] border-2 border-[#404040] relative overflow-hidden rounded-sm shadow-[0_0_20px_rgba(0,0,0,0.5)]">
+                  <div className="absolute inset-0 opacity-10 animate-[move-stripes_2s_linear_infinite]" style={{ backgroundImage: 'linear-gradient(45deg, #fff 25%, transparent 25%, transparent 50%, #fff 50%, #fff 75%, transparent 75%, transparent)', backgroundSize: '40px 40px' }} />
+                  <div className={`h-full transition-all duration-300 relative ${generationMode === 'precision' ? 'bg-blue-500 shadow-[0_0_25px_rgba(59,130,246,0.8)]' : 'bg-[#7fb332] shadow-[0_0_25px_rgba(127,179,50,0.8)]'}`} style={{ width: `${progress}%` }}><div className="absolute top-0 left-0 w-full h-[50%] bg-white/20" /></div>
+                </div>
+              </div>
+              <style>{`@keyframes move-stripes { 0% { background-position: 0 0; } 100% { background-position: 40px 0; } }`}</style>
+            </div>
+          )}
+
+          <section className="min-h-[350px]">
+            {isLoading ? (
+              <div className="flex flex-col items-center justify-center py-20 opacity-40"><i className="fa-solid fa-gear text-6xl animate-spin text-gray-500 mb-6"></i><p className="text-gray-500 text-sm italic mc-font">CALCULATING VIRTUAL PARAMETERS...</p></div>
+            ) : result ? (
+              <CommandOutput result={result} prompt={prompt} edition={edition} target={advanced.executionTarget} />
+            ) : (
+              <div className="border-2 border-dashed border-white/10 rounded-2xl flex flex-col items-center justify-center py-24 text-gray-500 opacity-40 group hover:opacity-60 transition-opacity">
+                <i className="fa-solid fa-terminal text-6xl mb-4 group-hover:scale-110 transition-transform"></i>
+                <p className="text-xl mc-font uppercase tracking-widest">Awaiting System Initialization</p>
+              </div>
+            )}
+          </section>
+        </div>
+        <HistorySidebar isOpen={showHistory} onClose={() => setShowHistory(false)} history={history} onSelect={(item) => { setResult(item.response); setEdition(item.edition); setPrompt(item.prompt); setShowHistory(false); }} onClear={clearHistory} onDeleteItem={deleteHistoryItem} onExport={exportData} onImport={() => fileInputRef.current?.click()} />
+        <ErrorModal error={errorDetail} onClose={() => setErrorDetail(null)} />
+      </main>
+      <footer className="p-6 text-center text-gray-600 text-xs border-t border-white/5 space-y-1">
+        <p>Built with Gemini 3 Pro (Precision) & Flash (Performance)</p>
+        <p className="opacity-50">Minecraft Specialist Engine v2.6 • For Java 1.21.x & Bedrock</p>
+      </footer>
+    </div>
+  );
+};
+
+export default App;

@@ -1,0 +1,137 @@
+
+import React, { useState, useMemo } from 'react';
+import { HistoryItem, GameEdition } from '../types';
+
+interface Props {
+  isOpen: boolean;
+  onClose: () => void;
+  history: HistoryItem[];
+  onSelect: (item: HistoryItem) => void;
+  onClear: () => void;
+  onDeleteItem: (id: string) => void;
+  onExport: () => void;
+  onImport: () => void;
+}
+
+const HistorySidebar: React.FC<Props> = ({ isOpen, onClose, history, onSelect, onClear, onDeleteItem, onExport, onImport }) => {
+  const [searchQuery, setSearchQuery] = useState('');
+
+  const filteredHistory = useMemo(() => {
+    if (!searchQuery.trim()) return history;
+    const query = searchQuery.toLowerCase();
+    return history.filter(item => 
+      item.prompt.toLowerCase().includes(query) || 
+      item.response.command.toLowerCase().includes(query)
+    );
+  }, [history, searchQuery]);
+
+  return (
+    <>
+      {isOpen && (
+        <div 
+          className="fixed inset-0 bg-black/60 backdrop-blur-sm z-40 transition-opacity"
+          onClick={onClose}
+        />
+      )}
+
+      <aside className={`fixed right-0 top-0 h-full w-85 bg-[#1e1e1e] border-l border-white/10 z-50 transform transition-transform duration-300 ease-in-out shadow-2xl ${
+        isOpen ? 'translate-x-0' : 'translate-x-full'
+      }`}>
+        <div className="p-6 h-full flex flex-col">
+          <div className="flex justify-between items-center mb-6">
+            <div className="flex items-center gap-2">
+              <h2 className="mc-font text-3xl text-white tracking-wide">履歴</h2>
+              <span className="text-[10px] bg-white/10 px-1.5 py-0.5 rounded text-gray-400 font-bold uppercase">Stored</span>
+            </div>
+            <div className="flex items-center gap-4">
+              {history.length > 0 && (
+                <button 
+                  onClick={onClear}
+                  className="text-red-500/60 hover:text-red-500 text-xs font-bold uppercase transition-colors"
+                  title="すべて削除"
+                >
+                  Clear All
+                </button>
+              )}
+              <button onClick={onClose} className="text-gray-500 hover:text-white transition-colors">
+                <i className="fa-solid fa-xmark text-2xl"></i>
+              </button>
+            </div>
+          </div>
+
+          <div className="mb-4 relative">
+            <i className="fa-solid fa-magnifying-glass absolute left-3 top-1/2 -translate-y-1/2 text-gray-500 text-sm"></i>
+            <input 
+              type="text"
+              value={searchQuery}
+              onChange={(e) => setSearchQuery(e.target.value)}
+              placeholder="履歴を検索..."
+              className="w-full bg-black/40 border border-white/10 rounded-md py-2 pl-10 pr-4 text-sm focus:outline-none focus:ring-1 focus:ring-[#3c8527] transition-all text-white placeholder:text-gray-600"
+            />
+          </div>
+
+          <div className="mb-6 bg-black/20 p-3 rounded-lg border border-white/5 space-y-3">
+             <h3 className="text-[10px] text-gray-500 uppercase font-bold tracking-widest flex items-center gap-2">
+               <i className="fa-solid fa-cloud-arrow-up"></i> Sync & Backup
+             </h3>
+             <div className="grid grid-cols-2 gap-2">
+                <button onClick={onExport} className="flex items-center justify-center gap-2 bg-white/5 hover:bg-white/10 border border-white/10 rounded py-1.5 text-[10px] font-bold text-gray-300 transition-all uppercase">
+                  <i className="fa-solid fa-download"></i> Export
+                </button>
+                <button onClick={onImport} className="flex items-center justify-center gap-2 bg-white/5 hover:bg-white/10 border border-white/10 rounded py-1.5 text-[10px] font-bold text-gray-300 transition-all uppercase">
+                  <i className="fa-solid fa-upload"></i> Import
+                </button>
+             </div>
+          </div>
+
+          <div className="flex-1 overflow-y-auto space-y-3 pr-2 custom-scrollbar no-scrollbar">
+            {filteredHistory.length === 0 ? (
+              <div className="text-center py-20 text-gray-600">
+                <i className="fa-solid fa-ghost text-4xl mb-4 opacity-20"></i>
+                <p className="text-sm">{searchQuery ? '見つかりませんでした' : '履歴はありません'}</p>
+              </div>
+            ) : (
+              filteredHistory.map((item) => (
+                <div key={item.id} className="relative group">
+                  <button
+                    onClick={() => onSelect(item)}
+                    className="w-full text-left bg-white/5 hover:bg-white/10 p-4 rounded-lg transition-colors border border-white/5 pr-10"
+                  >
+                    <div className="flex justify-between items-start text-[10px] font-bold mb-2">
+                      <div className="flex flex-col gap-1">
+                        <span className={`${item.edition === GameEdition.JAVA ? 'text-blue-400' : 'text-green-500'} uppercase tracking-tight`}>
+                          {item.edition === GameEdition.JAVA ? 'Java Edition' : 'Bedrock Edition'}
+                        </span>
+                        <span className="bg-white/10 text-white px-1.5 py-0.5 rounded-sm w-fit border border-white/5">
+                          Ver. {item.response.versionCompatible}
+                        </span>
+                      </div>
+                      <span className="text-gray-600">
+                        {new Date(item.timestamp).toLocaleDateString('ja-JP', { month: 'short', day: 'numeric' })}
+                      </span>
+                    </div>
+                    <p className="text-gray-300 line-clamp-2 text-sm font-medium">
+                      {item.prompt}
+                    </p>
+                  </button>
+                  <button 
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      onDeleteItem(item.id);
+                    }}
+                    className="absolute right-3 top-4 text-gray-600 hover:text-red-500 p-2 opacity-0 group-hover:opacity-100 transition-all"
+                    title="削除"
+                  >
+                    <i className="fa-solid fa-trash-can text-xs"></i>
+                  </button>
+                </div>
+              ))
+            )}
+          </div>
+        </div>
+      </aside>
+    </>
+  );
+};
+
+export default HistorySidebar;
